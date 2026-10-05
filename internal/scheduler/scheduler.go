@@ -8,6 +8,7 @@ package scheduler
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/h3yow/fleet-task-dispatcher-go/internal/domain"
@@ -25,10 +26,22 @@ func New(st *store.Store) *Scheduler {
 }
 
 // AddRobot 注册机器人容量并立即持久化。
+// 预留配置必须合法：Reserved 任一维不得为负、也不得超过 Capacity 对应维度，
+// 否则公共容量会出现负值，属于配置错误，明确拒绝而不是悄悄截断。
 func (sc *Scheduler) AddRobot(r domain.Robot) error {
+	if r.Reserved.AnyNegative() {
+		return domain.NewError(domain.ReasonInsufficientCapacity,
+			"robot %s reserved capacity must not be negative: %+v", r.ID, r.Reserved)
+	}
+	if !r.Capacity.Fits(r.Reserved) {
+		return domain.NewError(domain.ReasonInsufficientCapacity,
+			"robot %s reserved %+v exceeds capacity %+v", r.ID, r.Reserved, r.Capacity)
+	}
 	return sc.st.Commit(func(tx *store.Tx) error {
 		tx.AddRobot(r)
-		tx.Emit(domain.EventSubmitted, "", r.ID, fmt.Sprintf("robot registered capacity=%+v", r.Capacity), "")
+		tx.Emit(domain.EventSubmitted, "", r.ID,
+			fmt.Sprintf("robot registered capacity=%+v reserved=%+v reserve-min-priority=%d",
+				r.Capacity, r.Reserved, r.ReserveMinPriority), "")
 		return nil
 	})
 }
@@ -64,6 +77,8 @@ func (sc *Scheduler) Submit(t domain.Task) error {
 			}
 		}
 		// 容量校验：需求必须能被至少一个机器人单独承载，否则永远无法调度。
+		// 注意按任务优先级取有效容量：未达预留门槛的任务只能用公共容量
+		// （Capacity-Reserved），需求超过公共容量的普通任务永远排不上，必须拒绝。
 		robots := tx.Robots()
 		if len(robots) == 0 {
 			return domain.NewError(domain.ReasonInsufficientCapacity,
@@ -71,14 +86,14 @@ func (sc *Scheduler) Submit(t domain.Task) error {
 		}
 		fitsAny := false
 		for _, r := range robots {
-			if r.Capacity.Fits(t.Demand) {
+			if r.EffectiveCapacity(t.Priority).Fits(t.Demand) {
 				fitsAny = true
 				break
 			}
 		}
 		if !fitsAny {
 			return domain.NewError(domain.ReasonInsufficientCapacity,
-				"task %s demand %+v exceeds capacity of every robot", t.ID, t.Demand)
+				"task %s demand %+v exceeds effective capacity of every robot (priority=%d)", t.ID, t.Demand, t.Priority)
 		}
 
 		now := time.Now().UTC()
@@ -279,8 +294,14 @@ func (sc *Scheduler) dispatch(tx *store.Tx) {
 		robot, preempted := chooseRobot(tx, robots, cur.Task)
 		if robot == "" {
 			// 暂时无资源（包括无人可抢占）：保留 READY 等下一轮，不静默失败。
+			// 说明中带上该优先级在各机器人上的可用池，便于核对预留是否挡住了它。
+			var pools []string
+			for _, r := range robots {
+				pools = append(pools, fmt.Sprintf("%s:%+v", r.ID, tx.AvailableFor(r.ID, cur.Task.Priority)))
+			}
 			tx.Emit(domain.EventReady, cur.Task.ID, "",
-				fmt.Sprintf("no capacity yet demand=%+v, staying READY", cur.Task.Demand), "")
+				fmt.Sprintf("no capacity yet demand=%+v priority=%d pools=[%s], staying READY",
+					cur.Task.Demand, cur.Task.Priority, strings.Join(pools, " ")), "")
 			continue
 		}
 		for _, victimID := range preempted {
@@ -290,14 +311,18 @@ func (sc *Scheduler) dispatch(tx *store.Tx) {
 	}
 }
 
-// chooseRobot 为任务选择机器人：优先正常 best-fit；放不下时尝试在某机器人内
-// 抢占严格更低优先级的 RUNNING 任务。返回机器人 ID 与被抢占任务 ID。
+// chooseRobot 为任务选择机器人：优先按该任务优先级对应的容量池做 best-fit
+// （达门槛任务可用公共+预留，未达门槛只能用公共池）；放不下时才尝试在某
+// 机器人内抢占严格更低优先级的 RUNNING 任务。返回机器人 ID 与被抢占任务 ID。
+//
+// 与预留的配合：关键任务先吃预留区，只有"预留+公共"都不够时才进入抢占分支，
+// 因此预留充足时不会打断任何在途任务。
 func chooseRobot(tx *store.Tx, robots []domain.Robot, t domain.Task) (string, []string) {
-	// 1) 正常 best-fit：选择"剩余资源刚好够"的机器人（剩余量最小者）。
+	// 1) 正常 best-fit：在"该优先级可用池能容纳需求"的机器人中，选剩余量最小者。
 	best := ""
 	bestScore := -1
 	for _, r := range robots {
-		avail := tx.Available(r.ID)
+		avail := tx.AvailableFor(r.ID, t.Priority)
 		if !avail.Fits(t.Demand) {
 			continue
 		}
@@ -311,10 +336,14 @@ func chooseRobot(tx *store.Tx, robots []domain.Robot, t domain.Task) (string, []
 	}
 	// 2) 抢占：寻找抢占后能放下、且被抢任务全部严格低优先级的机器人。
 	for _, r := range robots {
-		if !r.Capacity.Fits(t.Demand) {
-			continue // 整个机器人都放不下，抢占也无意义
+		// 该优先级在本机的有效容量上限都装不下需求时，抢占也无意义
+		// （未达门槛的任务抢低优先级任务最多只能腾回公共池）。
+		if !r.EffectiveCapacity(t.Priority).Fits(t.Demand) {
+			continue
 		}
-		avail := tx.Available(r.ID)
+		// 被抢任务释放的占用会回到新任务可用的池：新任务达门槛时池就是整体容量；
+		// 未达门槛时被抢者优先级必然更低（同样未达门槛），其占用本就在公共池内。
+		avail := tx.AvailableFor(r.ID, t.Priority)
 		var victims []domain.TaskState
 		release := domain.Resources{}
 		ok := true

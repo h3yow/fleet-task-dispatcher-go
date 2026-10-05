@@ -243,6 +243,40 @@ func (tx *Tx) Available(robotID string) domain.Resources {
 	return avail
 }
 
+// usedBelow 计算机器人上优先级严格低于 threshold 的 RUNNING 任务占用量。
+// 这部分占用来自公共容量池（未达预留门槛的任务不得动用预留区）。
+func (tx *Tx) usedBelow(robotID string, threshold int) domain.Resources {
+	var used domain.Resources
+	for _, st := range tx.tasks {
+		if st.Status == domain.StatusRunning && st.Assigned == robotID && st.Task.Priority < threshold {
+			used = used.Add(st.Task.Demand)
+		}
+	}
+	return used
+}
+
+// AvailableFor 计算指定优先级任务在机器人上实际可动用的剩余容量：
+//   - 达到预留门槛（或未配置预留）：等于整体剩余容量 Capacity-Used；
+//   - 未达门槛：公共池剩余（Capacity-Reserved-低优先级占用）与整体剩余逐维取小，
+//     保证普通任务无法吃掉预留区，且任何一维都不会算出负数。
+//
+// 不变量被破坏（出现负值）时 panic，与 Available 一致，绝不静默吞掉。
+func (tx *Tx) AvailableFor(robotID string, priority int) domain.Resources {
+	r, ok := tx.robots[robotID]
+	if !ok {
+		return domain.Resources{}
+	}
+	avail := tx.Available(robotID)
+	if !r.HasReservation() || priority >= r.ReserveMinPriority {
+		return avail
+	}
+	common := r.CommonCapacity().Sub(tx.usedBelow(robotID, r.ReserveMinPriority))
+	if common.AnyNegative() {
+		panic("store: common-pool resources went negative on robot " + robotID)
+	}
+	return avail.Min(common)
+}
+
 // Emit 追加一条可解释事件。
 func (tx *Tx) Emit(kind domain.EventKind, taskID, robotID, detail string, reason domain.FailureReason) {
 	*tx.events = append(*tx.events, domain.Event{

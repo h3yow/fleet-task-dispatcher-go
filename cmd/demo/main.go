@@ -102,6 +102,37 @@ func main() {
 		time.Sleep(20 * time.Millisecond)
 	}
 
+	// 5) 预留容量：R2 预留 2 CPU 给优先级 >=5 的任务。
+	//    普通任务占满公共池后，关键任务直接吃预留区，不打断任何人。
+	must(sc.AddRobot(domain.Robot{
+		ID:                 "R2",
+		Capacity:           domain.Resources{CPU: 4},
+		Reserved:           domain.Resources{CPU: 2},
+		ReserveMinPriority: 5,
+	}))
+	must(sc.Submit(domain.Task{ID: "common-1", Priority: 1, Demand: domain.Resources{CPU: 2}}))
+	must(sc.Submit(domain.Task{ID: "common-2", Priority: 1, Demand: domain.Resources{CPU: 2}}))
+	must(sc.Tick())
+	waitFor(st, "common-1", domain.StatusRunning, time.Second)
+	for _, t := range st.Snapshot().Tasks {
+		if t.Task.ID == "common-2" {
+			fmt.Printf("R2 common pool (2 CPU) filled by common-1; common-2 status=%s robot=%s (R2 reserved pool off-limits, placed on R1 public capacity)\n",
+				t.Status, t.Assigned)
+		}
+	}
+	must(sc.Submit(domain.Task{ID: "critical", Priority: 9, Demand: domain.Resources{CPU: 2}}))
+	must(sc.Tick())
+	waitFor(st, "critical", domain.StatusRunning, time.Second)
+	for _, t := range st.Snapshot().Tasks {
+		switch t.Task.ID {
+		case "common-1":
+			fmt.Printf("with reserved pool: common-1 status=%s (never interrupted)\n", t.Status)
+		case "critical":
+			fmt.Printf("with reserved pool: critical status=%s robot=%s (served from reserved pool)\n", t.Status, t.Assigned)
+		}
+	}
+	waitFor(st, "critical", domain.StatusSucceeded, 2*time.Second)
+
 	stop()
 	printSummary(st, dbPath)
 }

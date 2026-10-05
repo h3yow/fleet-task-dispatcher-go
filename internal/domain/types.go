@@ -71,7 +71,18 @@ func (r Resources) Add(o Resources) Resources {
 
 // Sub 资源逐维相减；允许出现负值用于中间计算，最终占用由存储层校验。
 func (r Resources) Sub(o Resources) Resources {
-	return Resources{CPU: r.CPU - o.CPU, Power: r.Power - o.Payload, Payload: r.Payload - o.Payload}
+	return Resources{CPU: r.CPU - o.CPU, Power: r.Power - o.Power, Payload: r.Payload - o.Payload}
+}
+
+// Min 资源逐维取较小值。
+func (r Resources) Min(o Resources) Resources {
+	m := func(a, b int) int {
+		if a < b {
+			return a
+		}
+		return b
+	}
+	return Resources{CPU: m(r.CPU, o.CPU), Power: m(r.Power, o.Power), Payload: m(r.Payload, o.Payload)}
 }
 
 // Fits 判断 r 是否能容纳 need（need 的每一维均不超过 r）。
@@ -112,6 +123,32 @@ type TaskState struct {
 type Robot struct {
 	ID       string
 	Capacity Resources
+	// Reserved 按维度划出的预留容量：只有优先级达到 ReserveMinPriority 的
+	// 任务才能动用这部分；其余任务最多使用 Capacity-Reserved 的公共容量。
+	// 零值表示不配置预留，行为与不感知预留的旧版本完全一致。
+	Reserved Resources
+	// ReserveMinPriority 动用预留区所需的最低优先级（含）。
+	ReserveMinPriority int
+}
+
+// CommonCapacity 返回低优先级任务可使用的公共容量（Capacity-Reserved，逐维不为负）。
+// 调用方需保证 Reserved 各维不超过 Capacity（注册机器人时已校验）。
+func (r Robot) CommonCapacity() Resources {
+	return r.Capacity.Sub(r.Reserved)
+}
+
+// HasReservation 判断该机器人是否配置了预留区。
+func (r Robot) HasReservation() bool {
+	return !r.Reserved.IsZero()
+}
+
+// EffectiveCapacity 返回给定优先级任务在该机器人上可动用的总容量上限：
+// 达到预留门槛的任务可用全部容量，否则只能用公共容量。
+func (r Robot) EffectiveCapacity(priority int) Resources {
+	if r.HasReservation() && priority < r.ReserveMinPriority {
+		return r.CommonCapacity()
+	}
+	return r.Capacity
 }
 
 // EventKind 事件种类。

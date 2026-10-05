@@ -69,9 +69,41 @@ JUDGE low preserved as PREEMPTED: "preempted by higher-priority task high ..."
 - 机器人选择：**best-fit**——在"剩余资源能容纳需求"的机器人中，选剩余总量最小者，
   尽量为后来的大任务保留整块容量。
 - 多维资源（`CPU / Power / Payload`）逐维比较，任一维不足即放不下。
-- 暂时无容量的任务保留 `READY` 等下一轮，**不会静默失败，也不会被强行调度**。
+- 暂时无容量的任务保留 `READY` 等下一轮，**不会静默失败，也不会被强行调度**；
+  事件说明中会带上该任务优先级在各机器人上的可用池，便于核对是否被预留挡住。
 - 资源占用只统计 `RUNNING` 任务；`Used`/`Available` 在事务临界区内计算，
   一旦出现负的可用量会直接 panic（不变量破坏不静默吞掉）。
+
+### 3.1 预留容量（按资源维度）
+
+每台机器人可以按维度划出一部分容量作为 **预留区**，只供高优先级任务使用：
+
+```go
+sc.AddRobot(domain.Robot{
+    ID:                 "R2",
+    Capacity:           domain.Resources{CPU: 4, Power: 2}, // 总容量
+    Reserved:           domain.Resources{CPU: 2},           // 预留区（逐维度）
+    ReserveMinPriority: 5,                                  // 动用预留区的优先级门槛（含）
+})
+```
+
+- **公共池 = Capacity − Reserved（逐维）**。优先级低于 `ReserveMinPriority` 的任务
+  只能使用公共池：判定口径为 `min(整体剩余, 公共池容量 − 未达门槛任务的占用)`，
+  每一维独立核算，任何一维都算不出负数。
+- 达到门槛的任务可以使用 **公共池 + 预留区**（即整体容量）。
+- 预留配置本身会被校验：`Reserved` 任一维为负、或超过 `Capacity` 对应维度时，
+  `AddRobot` 明确返回 `INSUFFICIENT_CAPACITY` 错误，绝不让公共容量被悄悄算成负数。
+- **准入校验同步生效**：未达门槛、且需求超过公共容量的任务在 `Submit` 时就被
+  `INSUFFICIENT_CAPACITY` 拒绝（它永远排不上队）；同样的需求若优先级达到门槛
+  则可正常接纳。
+- **与抢占的配合**：关键任务到来时先在"公共+预留"里做 best-fit，预留区够就
+  **直接吃预留区、不打断任何在途任务**；只有连预留区也不够时，才走第 4 节的
+  抢占规则（被抢占者仍保留为可解释、可恢复的 `PREEMPTED`）。未达门槛的任务之间
+  抢占规则不变，但释放出来的也只是公共池容量，抢不出预留区。
+- **兼容表现**：不配置预留（`Reserved` 为零值）时，所有判定路径与旧版本完全一致。
+- **持久化与恢复**：预留配置随 `Robot` 一起进快照；占用量永远从 `RUNNING` 任务
+  现算，因此重启后"预留配置 + 中断瞬间的占用"自然对得上，终态任务不会占回来，
+  预留区也不会因为并发调度或快照恢复被突破。
 
 ### 4. 优先级抢占
 
@@ -163,4 +195,10 @@ JUDGE low preserved as PREEMPTED: "preempted by higher-priority task high ..."
 | 抢占保留可解释状态、同级不抢占、完成后重排 | `TestPreemptionKeepsVictimExplainable`、`TestNoPreemptionAcrossSameOrHigherPriority`、`TestPreemptionInterruptsExecution` |
 | 取消/超时释放完整、可用资源非负 | `TestCancelReleasesResources`、`TestSuccessFailureTimeout` |
 | 中断重启恢复、终态不重派 | `TestRecoveryAfterRestart` |
+| 预留区只对达门槛任务开放、普通任务够不到 | `TestReservedPoolOnlyForEligiblePriority`、`TestCommonTaskCannotTouchReserved` |
+| 预留按维度核算、多维不超配、剩余不为负 | `TestMultiDimReservationNoOvercommit` |
+| 并发调度下预留不被突破、不重复派发 | `TestConcurrentDispatchReservedNotBreached` |
+| 预留不足才回退抢占、被抢任务可恢复 | `TestReservedFallsBackToPreemption` |
+| 重启后预留配置与占用一致、终态不占回 | `TestRecoveryKeepsReservationConsistent` |
+| 非法预留配置（为负/超容量）明确拒绝 | `TestInvalidReservationRejected` |
 | 持久化原子写、回滚、资源核算 | `internal/store` 下全部用例 |
