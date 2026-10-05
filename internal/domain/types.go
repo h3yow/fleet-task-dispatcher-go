@@ -37,6 +37,7 @@ const (
 	ReasonTaskNotFound         FailureReason = "TASK_NOT_FOUND"
 	ReasonExecutionFailed      FailureReason = "EXECUTION_FAILED"
 	ReasonTimeout              FailureReason = "TIMEOUT"
+	ReasonInvalidReservation   FailureReason = "INVALID_RESERVATION"
 )
 
 // IsTerminal 判断任务是否处于不可再派发的终态。
@@ -71,7 +72,7 @@ func (r Resources) Add(o Resources) Resources {
 
 // Sub 资源逐维相减；允许出现负值用于中间计算，最终占用由存储层校验。
 func (r Resources) Sub(o Resources) Resources {
-	return Resources{CPU: r.CPU - o.CPU, Power: r.Power - o.Payload, Payload: r.Payload - o.Payload}
+	return Resources{CPU: r.CPU - o.CPU, Power: r.Power - o.Power, Payload: r.Payload - o.Payload}
 }
 
 // Fits 判断 r 是否能容纳 need（need 的每一维均不超过 r）。
@@ -112,6 +113,32 @@ type TaskState struct {
 type Robot struct {
 	ID       string
 	Capacity Resources
+	// Reserved 预留区容量（逐维度）。只有优先级达到 ReserveMinPriority 的
+	// 任务才能动用这部分容量；零值表示不启用预留，行为与此前完全一致。
+	Reserved Resources
+	// ReserveMinPriority 动用预留区的优先级门槛：Priority >= 门槛才可用预留区。
+	ReserveMinPriority int
+}
+
+// HasReservation 判断机器人是否配置了预留区。
+func (r Robot) HasReservation() bool {
+	return !r.Reserved.IsZero()
+}
+
+// PublicCapacity 返回公共区容量（任何任务都可使用），逐维 = Capacity - Reserved。
+// 配置经 AddRobot 校验（Reserved 每维不超过 Capacity），结果不会为负。
+func (r Robot) PublicCapacity() Resources {
+	return r.Capacity.Sub(r.Reserved)
+}
+
+// EffectiveCapacity 返回给定优先级任务可动用的总容量上限：
+// 达到门槛的任务可用全部容量（公共区 + 预留区）；
+// 未达门槛的任务只能用公共区，绝不能碰预留部分。
+func (r Robot) EffectiveCapacity(priority int) Resources {
+	if !r.HasReservation() || priority >= r.ReserveMinPriority {
+		return r.Capacity
+	}
+	return r.PublicCapacity()
 }
 
 // EventKind 事件种类。

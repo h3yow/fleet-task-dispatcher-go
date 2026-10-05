@@ -25,10 +25,22 @@ func New(st *store.Store) *Scheduler {
 }
 
 // AddRobot 注册机器人容量并立即持久化。
+// 预留区配置校验：Reserved 任一维不得为负、也不得超过 Capacity 对应维度，
+// 否则公共区会出现负容量，拒绝注册并返回 INVALID_RESERVATION。
 func (sc *Scheduler) AddRobot(r domain.Robot) error {
+	if r.Reserved.AnyNegative() {
+		return domain.NewError(domain.ReasonInvalidReservation,
+			"robot %s reserved capacity must not be negative: %+v", r.ID, r.Reserved)
+	}
+	if !r.Capacity.Fits(r.Reserved) {
+		return domain.NewError(domain.ReasonInvalidReservation,
+			"robot %s reserved %+v exceeds capacity %+v in some dimension", r.ID, r.Reserved, r.Capacity)
+	}
 	return sc.st.Commit(func(tx *store.Tx) error {
 		tx.AddRobot(r)
-		tx.Emit(domain.EventSubmitted, "", r.ID, fmt.Sprintf("robot registered capacity=%+v", r.Capacity), "")
+		tx.Emit(domain.EventSubmitted, "", r.ID,
+			fmt.Sprintf("robot registered capacity=%+v reserved=%+v reserve-min-priority=%d",
+				r.Capacity, r.Reserved, r.ReserveMinPriority), "")
 		return nil
 	})
 }
@@ -64,6 +76,8 @@ func (sc *Scheduler) Submit(t domain.Task) error {
 			}
 		}
 		// 容量校验：需求必须能被至少一个机器人单独承载，否则永远无法调度。
+		// 未达预留门槛的任务按公共区容量核算——超出公共区的需求对它而言
+		// 永远无法满足，必须在准入期明确拒绝而不是静默排队。
 		robots := tx.Robots()
 		if len(robots) == 0 {
 			return domain.NewError(domain.ReasonInsufficientCapacity,
@@ -71,14 +85,14 @@ func (sc *Scheduler) Submit(t domain.Task) error {
 		}
 		fitsAny := false
 		for _, r := range robots {
-			if r.Capacity.Fits(t.Demand) {
+			if r.EffectiveCapacity(t.Priority).Fits(t.Demand) {
 				fitsAny = true
 				break
 			}
 		}
 		if !fitsAny {
 			return domain.NewError(domain.ReasonInsufficientCapacity,
-				"task %s demand %+v exceeds capacity of every robot", t.ID, t.Demand)
+				"task %s demand %+v exceeds effective capacity of every robot (priority=%d)", t.ID, t.Demand, t.Priority)
 		}
 
 		now := time.Now().UTC()
@@ -292,12 +306,16 @@ func (sc *Scheduler) dispatch(tx *store.Tx) {
 
 // chooseRobot 为任务选择机器人：优先正常 best-fit；放不下时尝试在某机器人内
 // 抢占严格更低优先级的 RUNNING 任务。返回机器人 ID 与被抢占任务 ID。
+//
+// 预留区语义：核算一律基于 EffectiveCapacity——达到预留门槛的任务按全容量
+// （公共区 + 预留区）核算，因此关键任务会先吃掉预留区，只有预留区也不够时
+// 才进入抢占分支；未达门槛的任务只按公共区核算，永远碰不到预留部分。
 func chooseRobot(tx *store.Tx, robots []domain.Robot, t domain.Task) (string, []string) {
 	// 1) 正常 best-fit：选择"剩余资源刚好够"的机器人（剩余量最小者）。
 	best := ""
 	bestScore := -1
 	for _, r := range robots {
-		avail := tx.Available(r.ID)
+		avail := effectiveAvailable(tx, r, t.Priority)
 		if !avail.Fits(t.Demand) {
 			continue
 		}
@@ -310,11 +328,13 @@ func chooseRobot(tx *store.Tx, robots []domain.Robot, t domain.Task) (string, []
 		return best, nil
 	}
 	// 2) 抢占：寻找抢占后能放下、且被抢任务全部严格低优先级的机器人。
+	// 容量上限同样是有效容量：低优先级任务即使抢占了别人，也不能挤进预留区。
 	for _, r := range robots {
-		if !r.Capacity.Fits(t.Demand) {
-			continue // 整个机器人都放不下，抢占也无意义
+		cap := r.EffectiveCapacity(t.Priority)
+		if !cap.Fits(t.Demand) {
+			continue // 有效容量整体都放不下，抢占也无意义
 		}
-		avail := tx.Available(r.ID)
+		avail := effectiveAvailable(tx, r, t.Priority)
 		var victims []domain.TaskState
 		release := domain.Resources{}
 		ok := true
@@ -338,6 +358,13 @@ func chooseRobot(tx *store.Tx, robots []domain.Robot, t domain.Task) (string, []
 		}
 	}
 	return "", nil
+}
+
+// effectiveAvailable 计算某优先级任务在机器人上当前可动用的剩余容量。
+// 结果可能为负（高优先级任务占用了预留区时，低优先级任务的有效剩余会小于零），
+// 此时 Fits 自然判定放不下；调用方不得将其当作非负量使用。
+func effectiveAvailable(tx *store.Tx, r domain.Robot, priority int) domain.Resources {
+	return r.EffectiveCapacity(priority).Sub(tx.Used(r.ID))
 }
 
 // preempt 将被抢占的任务保留为可解释的 PREEMPTED 状态并回到可重试队列。
@@ -389,7 +416,21 @@ func (sc *Scheduler) assign(tx *store.Tx, st domain.TaskState, robotID string) {
 	st.UpdatedAt = time.Now().UTC()
 	tx.PutTask(st)
 	tx.Emit(domain.EventAssigned, st.Task.ID, robotID,
-		fmt.Sprintf("assigned demand=%+v available-after=%+v", st.Task.Demand, tx.Available(robotID)), "")
+		fmt.Sprintf("assigned demand=%+v available-after=%+v%s", st.Task.Demand, tx.Available(robotID), reservedNote(tx, robotID)), "")
+}
+
+// reservedNote 在机器人配置了预留区时，说明本次分配后是否动用了预留区，
+// 让"关键任务吃预留区、普通任务只用公共区"的结论可以从事件流直接核对。
+func reservedNote(tx *store.Tx, robotID string) string {
+	r, ok := tx.Robot(robotID)
+	if !ok || !r.HasReservation() {
+		return ""
+	}
+	used := tx.Used(robotID)
+	if r.PublicCapacity().Fits(used) {
+		return fmt.Sprintf(" reserved=%+v(untouched, public-used=%+v/%+v)", r.Reserved, used, r.PublicCapacity())
+	}
+	return fmt.Sprintf(" reserved=%+v(IN-USE, used=%+v exceeds public=%+v)", r.Reserved, used, r.PublicCapacity())
 }
 
 func (sc *Scheduler) toReady(tx *store.Tx, st domain.TaskState) {

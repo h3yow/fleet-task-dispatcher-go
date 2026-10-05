@@ -26,6 +26,9 @@ go run ./cmd/demo
 
 # 全量单测（含竞态检测），日志会打印每个用例的输入与判定依据
 go test ./... -race -count=1 -v
+
+# 只跑预留容量相关用例（输入与判定同样打印在日志里）
+go test ./internal/scheduler/ -run 'Reserved|Reservation|HighPriorityPrefers|MultiDim' -race -count=1 -v
 ```
 
 演示与单测的关键日志形如：
@@ -86,7 +89,47 @@ JUDGE low preserved as PREEMPTED: "preempted by higher-priority task high ..."
   资源重复计入或瞬时超卖；执行器轮询发现任务已离开 `RUNNING` 会取消其执行协程，
   协程迟到的执行结果不会覆盖抢占/取消状态。
 
-### 5. 并发与幂等
+### 5. 预留容量（按维度、按优先级门槛）
+
+每台机器人可以把一部分容量划为 **预留区**，只服务高优先级任务：
+
+```go
+sc.AddRobot(domain.Robot{
+    ID:                 "r1",
+    Capacity:           domain.Resources{CPU: 8, Power: 8}, // 总容量
+    Reserved:           domain.Resources{CPU: 3, Power: 3}, // 预留区（逐维度）
+    ReserveMinPriority: 10,                                 // 优先级 >= 10 才能动用预留区
+})
+```
+
+核算规则（每个维度独立结算，互不相借）：
+
+- **公共区** = `Capacity - Reserved`（逐维）。任何任务都可以使用公共区。
+- 优先级 `>= ReserveMinPriority` 的任务按 **全容量**（公共区 + 预留区）核算；
+  未达门槛的任务只按公共区核算，**永远碰不到预留部分**——哪怕预留区正闲着。
+- 注册时校验：`Reserved` 任一维为负或超过 `Capacity` 对应维度，
+  拒绝注册并返回 `INVALID_RESERVATION`（公共区不能为负）。
+- **未配置预留（`Reserved` 为零值）时行为与此前完全一致**：所有任务按全容量核算，
+  旧快照（无预留字段）加载后 `Reserved` 自然为零值，无缝兼容。
+
+与调度、抢占的配合：
+
+- 准入校验按 **该任务优先级可动用的有效容量** 判定：低优先级任务需求超过公共区
+  （即使没超过全容量）会在 `Submit` 时以 `INSUFFICIENT_CAPACITY` 明确拒绝，
+  而不是排队静默等待。
+- 关键任务到来时 **优先吃预留区**：只要全容量还放得下就直接派发，不打断任何人；
+  只有预留区也不够时，才按第 4 节规则抢占严格更低优先级的任务。
+  被抢占者仍保留为可解释、可恢复的 `PREEMPTED`。
+- 低优先级任务即使通过抢占释放资源，核算上限仍是公共区——抢占不能把低优先级
+  任务抬进预留区。
+- 派发事件会标注预留区状态（`reserved={...}(untouched ...)` / `(IN-USE ...)`），
+  事后可从事件流直接核对"谁在什么时候动用了预留区"。
+- 占用释放在任务进入终态/`PREEMPTED` 的同一事务内完成（占用只统计 `RUNNING`），
+  正常完成、失败、超时、取消、被抢占都会完整退回，不重扣不漏扣；
+  预留配置随机器人定义一起进快照，重启后配置与中断时的占用严格对得上，
+  终态任务不会再占资源。
+
+### 6. 并发与幂等
 
 - 所有状态读写都经过 `Store.Commit`（单把 `sync.Mutex` 串行化）+ 原子落盘；
   因此任意数量的调度入口并发调用 `Submit/Tick/Cancel`，结论等价于某种串行顺序。
@@ -95,7 +138,7 @@ JUDGE low preserved as PREEMPTED: "preempted by higher-priority task high ..."
 - `Commit` 回调返回错误时整体回滚（内存改动与文件落盘都不发生）。
 - `Cancel` 对终态任务是幂等空操作；对未知任务返回 `TASK_NOT_FOUND`。
 
-### 6. 取消与超时的资源释放
+### 7. 取消与超时的资源释放
 
 - 取消：任务立即 `CANCELED`、清空 `Assigned`，占用在同一事务内完整释放；
   执行器在下一次轮询（默认 5ms）取消其执行协程。
@@ -104,7 +147,7 @@ JUDGE low preserved as PREEMPTED: "preempted by higher-priority task high ..."
 - 执行协程观察到取消后回写时会重新读取状态：若任务已是 `CANCELED`/`PREEMPTED`，
   执行结果被丢弃，绝不把已释放的资源"加回来"造成负值。
 
-### 7. 故障恢复
+### 8. 故障恢复
 
 - 每次成功的事务都把全量快照以 **写临时文件 + rename** 的方式原子落盘（JSON）。
 - 执行器的任务 ctx 与进程生命周期 ctx **相互独立**：进程关闭时在途任务的结果
@@ -146,9 +189,10 @@ JUDGE low preserved as PREEMPTED: "preempted by higher-priority task high ..."
 | --- | --- | --- |
 | `CYCLE_DEPENDENCY` | Submit / Tick | 依赖图存在环 |
 | `DEPENDENCY_FAILED` | Tick 传播 | 依赖失败或被取消 |
-| `INSUFFICIENT_CAPACITY` | Submit | 容量为负、无机器人或超出全部机器人容量 |
+| `INSUFFICIENT_CAPACITY` | Submit | 容量为负、无机器人或超出全部机器人有效容量（含预留门槛限制） |
 | `DUPLICATE_TASK` | Submit | 任务 ID 已存在 |
 | `TASK_NOT_FOUND` | Submit / Cancel | 依赖或取消目标不存在 |
+| `INVALID_RESERVATION` | AddRobot | 预留区为负或超过总容量某一维 |
 | `EXECUTION_FAILED` | Executor | run 函数返回错误 / 被异常中断 |
 | `TIMEOUT` | Executor | 执行超过任务 Timeout |
 
@@ -163,4 +207,9 @@ JUDGE low preserved as PREEMPTED: "preempted by higher-priority task high ..."
 | 抢占保留可解释状态、同级不抢占、完成后重排 | `TestPreemptionKeepsVictimExplainable`、`TestNoPreemptionAcrossSameOrHigherPriority`、`TestPreemptionInterruptsExecution` |
 | 取消/超时释放完整、可用资源非负 | `TestCancelReleasesResources`、`TestSuccessFailureTimeout` |
 | 中断重启恢复、终态不重派 | `TestRecoveryAfterRestart` |
+| 预留区只对够门槛任务开放、普通任务占不到 | `TestReservedOnlyForEligibleTasks` |
+| 关键任务优先吃预留区、不够才抢占且被抢者可解释 | `TestHighPriorityPrefersReservationOverPreemption` |
+| 多维预留分别核算、不超配、剩余不为负 | `TestMultiDimReservationAccounting` |
+| 并发调度下预留不被突破 | `TestConcurrentReservationNotBreached` |
+| 重启后预留配置与占用一致、终态不占资源 | `TestReservationRecoveryConsistency` |
 | 持久化原子写、回滚、资源核算 | `internal/store` 下全部用例 |
